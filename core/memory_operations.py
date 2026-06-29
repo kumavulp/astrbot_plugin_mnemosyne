@@ -239,20 +239,54 @@ def _post_process_search_results(
             return -float(distance)
         return 0.0
 
+    # [decay] 时间衰减因子
+    import math as _math
+    _decay_enabled = plugin.config.get("decay_enabled", True)
+    _decay_lambda = plugin.config.get("decay_lambda", 0.01)
+    _now = _math.floor(__import__("time").time())
+
+    _emotional_keywords = frozenset("哭,崩溃,害怕,焦虑,恐惧,绝望,难过,委屈,心疼,生气,吵架,和好,道歉,想你,想我,爱你,爱我,撒娇,吃醋,感动,高潮,亲密,月经,多囊,荨麻疹,纪念,结婚,求婚,520,小荷包,院子,李小黑,Cc,小橘子,小花".split(","))
+    def _time_decay_score(item: dict[str, Any]) -> float:
+        if not _decay_enabled:
+            return 1.0
+        ct = item.get("create_time")
+        if not isinstance(ct, (int, float)) or ct <= 0:
+            return 0.5
+        age_days = max((_now - ct) / 86400.0, 0)
+        c = str(item.get("content", ""))
+        is_emotional = any(kw in c for kw in _emotional_keywords)
+        rate = _decay_lambda * 0.5 if is_emotional else _decay_lambda
+        return _math.exp(-rate * age_days)
+
     scored = []
     for item in prepared:
         content = str(item.get("content", ""))
         content_l = content.lower()
-        keyword_hits = 0
+        keyword_hits = 0.0
         for term in all_terms:
             term_l = term.lower()
-            if term_l and term_l in content_l:
-                keyword_hits += 1
-        scored.append((keyword_hits, _semantic_score(item), item))
+            if not term_l:
+                continue
+            if term_l in content_l:
+                keyword_hits += 1.0
+            else:
+                try:
+                    from rapidfuzz import fuzz as _fuzz
+                    ratio = _fuzz.partial_ratio(term_l, content_l)
+                    if ratio >= 75:
+                        keyword_hits += ratio / 100.0
+                except ImportError:
+                    pass
+        decay = _time_decay_score(item)
+        scored.append((keyword_hits, _semantic_score(item) * decay, decay, item))
 
-    if any(hit > 0 for hit, _, _ in scored):
+    if any(hit > 0 for hit, _, _, _ in scored):
         scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        return [item for _, _, item in scored]
+        return [item for _, _, _, item in scored]
+    # 即使没有关键词命中，也按衰减排序
+    if _decay_enabled:
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [item for _, _, _, item in scored]
     return prepared
 
 
@@ -1088,7 +1122,7 @@ async def _store_summary_to_milvus(
     collection_name = plugin.collection_name
     current_timestamp = int(time.time())
 
-    # [fix] 存储容量保护：检查记忆条数是否超过上限
+    # [decay] 存储容量保护：到上限时自动淘汰最旧记忆
     max_memories = plugin.config.get("max_memory_count", 2000)
     if max_memories > 0 and plugin.milvus_manager:
         try:
@@ -1097,11 +1131,25 @@ async def _store_summary_to_milvus(
                 count = collection.num_entities
                 logger.info(f"[容量检查] num_entities={count}, max={max_memories}")
                 if count >= max_memories:
-                    logger.warning(
-                        f"记忆条数已达上限 ({count}/{max_memories})，跳过本次写入。"
-                        f"请清理旧记忆或调大 max_memory_count 配置。"
-                    )
-                    return False
+                    evict_count = max(int(max_memories * 0.05), 10)
+                    logger.info(f"[衰减] 记忆已满 ({count}/{max_memories})，自动淘汰最旧的 {evict_count} 条...")
+                    try:
+                        oldest = plugin.milvus_manager.query(
+                            collection_name=collection_name,
+                            expression="memory_id > 0",
+                            output_fields=["memory_id", "create_time"],
+                            limit=min(evict_count * 3, 500),
+                        )
+                        if oldest:
+                            oldest.sort(key=lambda x: x.get("create_time", 0))
+                            ids_to_delete = [m["memory_id"] for m in oldest[:evict_count]]
+                            if ids_to_delete:
+                                delete_expr = f"memory_id in {ids_to_delete}"
+                                plugin.milvus_manager.delete(collection_name, delete_expr)
+                                logger.info(f"[衰减] 成功淘汰 {len(ids_to_delete)} 条最旧记忆")
+                    except Exception as evict_err:
+                        logger.error(f"[衰减] 自动淘汰失败: {evict_err}")
+                        return False
         except Exception as e:
             logger.debug(f"检查记忆容量时出错（不影响写入）: {e}")
 
