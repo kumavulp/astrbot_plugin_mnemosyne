@@ -28,6 +28,7 @@ from .security_utils import (
     validate_session_id,
 )
 from .tools import (
+    extract_event_annotation,
     extract_query_keywords,
     format_context_to_string,
     pack_memory_content,
@@ -932,8 +933,21 @@ def _format_and_inject_memory(
     long_memory_suffix = plugin.config.get("long_memory_suffix", "</Mnemosyne>")
     long_memory = f"{long_memory_prefix}\n"
 
+    _STATUS_LABELS = {
+        "planned": "计划中",
+        "done": "已完成",
+        "recurring": "长期",
+        "cancelled": "已取消",
+    }
+
     for result in detailed_results:
-        content = strip_memory_meta(str(result.get("content", "内容缺失")))
+        raw_content = str(result.get("content", "内容缺失"))
+        # 后处理已把 meta 剥到 _meta 字段；直接传原始数据的路径则现场拆分
+        item_meta = result.get("_meta")
+        if isinstance(item_meta, dict) and item_meta:
+            content = strip_memory_meta(raw_content)
+        else:
+            content, item_meta = split_memory_content_meta(raw_content)
         ts = result.get("create_time")
         try:
             time_str = (
@@ -943,6 +957,18 @@ def _format_and_inject_memory(
             )
         except (TypeError, ValueError):
             time_str = f"时间戳: {ts}" if ts else "未知时间"
+
+        # [event] 事件时间锚与状态：区分"记录时间"和"事件时间"
+        if isinstance(item_meta, dict):
+            ev_date = item_meta.get("event_date")
+            ev_status = item_meta.get("event_status")
+            annotations = []
+            if ev_date:
+                annotations.append(f"事件日期:{ev_date}")
+            if ev_status and ev_status in _STATUS_LABELS:
+                annotations.append(_STATUS_LABELS[ev_status])
+            if annotations:
+                content = f"({'/'.join(annotations)}) {content}"
 
         memory_entry_format = plugin.config.get(
             "memory_entry_format", "- [{time}] {content}"
@@ -1106,6 +1132,23 @@ async def _get_summary_llm_response(
                         f"当前绝对时间：{now_str}。"
                         "如果原始对话未明确给出具体日期/年份，禁止臆造精确日期；"
                         "请使用“近期/之前/后来”等相对表达。"
+                    ),
+                }
+            )
+
+        # [event] 事件时间锚与状态标注：区分"旧事重提"和"新事确立"
+        if plugin.config.get("use_event_annotation", True):
+            summary_contexts.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "如果总结内容涉及具体的约定、计划、承诺或事件，请在总结文本末尾"
+                        "另起一行附加标记：<EVENT date=\"YYYY-MM-DD\" status=\"...\"/>。"
+                        "date 填事件实际发生/约定的日期（注意：对话中提起旧事时，date 应是"
+                        "旧事原本的日期，不是今天）；无法确定具体日期时省略 date 属性。"
+                        "status 可选值：planned(计划中)/done(已完成)/recurring(长期重复)/"
+                        "cancelled(已取消)。"
+                        "大部分日常对话不需要此标记，仅在涉及明确事件时添加，且最多一个。"
                     ),
                 }
             )
@@ -1324,6 +1367,15 @@ async def handle_summary_long_memory(
         if not summary_text:
             return False
 
+        # [event] 解析并剥离事件标注（<EVENT date=... status=.../>）
+        event_meta: dict[str, Any] = {}
+        if plugin.config.get("use_event_annotation", True):
+            summary_text, event_meta = extract_event_annotation(summary_text)
+            if not summary_text:
+                return False
+            if event_meta:
+                logger.debug(f"事件标注: {event_meta}")
+
         # 3. 获取总结文本的 Embedding
         # 使用 AstrBot EmbeddingProvider（异步）
         try:
@@ -1358,6 +1410,8 @@ async def handle_summary_long_memory(
             "use_lightweight_memory_graph", True
         ):
             metadata = _build_lightweight_graph_metadata(summary_text, context_history)
+        if event_meta:
+            metadata.update(event_meta)
         stored_content = pack_memory_content(summary_text, metadata)
 
         # 4. 存储到 Milvus

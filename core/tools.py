@@ -441,6 +441,39 @@ def extract_query_keywords(text: str, min_token_len: int = 2) -> list[str]:
     return keywords
 
 
+_EVENT_TAG_RE = re.compile(
+    r'<EVENT\s*(?:date="(\d{4}-\d{2}-\d{2})")?\s*(?:status="(planned|done|recurring|cancelled)")?\s*/?>',
+    re.IGNORECASE,
+)
+_VALID_EVENT_STATUS = frozenset({"planned", "done", "recurring", "cancelled"})
+
+
+def extract_event_annotation(text: str) -> tuple[str, dict[str, Any]]:
+    """
+    从总结文本中提取 <EVENT date="..." status="..."/> 标记。
+    返回 (剥离标记后的纯文本, event元数据dict)。
+    没有标记或标记非法时返回原文本和空dict，保证向后兼容。
+    """
+    if not isinstance(text, str) or "<EVENT" not in text:
+        return text, {}
+
+    match = _EVENT_TAG_RE.search(text)
+    if not match:
+        # 有<EVENT但格式不对，剥掉残缺标记防止污染正文
+        cleaned = re.sub(r'<EVENT[^>]*/?>', '', text).strip()
+        return cleaned, {}
+
+    event_meta: dict[str, Any] = {}
+    date_str, status_str = match.group(1), match.group(2)
+    if date_str:
+        event_meta["event_date"] = date_str
+    if status_str and status_str.lower() in _VALID_EVENT_STATUS:
+        event_meta["event_status"] = status_str.lower()
+
+    cleaned = (text[: match.start()] + text[match.end():]).strip()
+    return cleaned, event_meta
+
+
 def pack_memory_content(content: str, metadata: dict[str, Any] | None) -> str:
     """
     将内部元数据以隐藏标签附加到记忆内容末尾。

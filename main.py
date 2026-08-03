@@ -812,12 +812,14 @@ class Mnemosyne(Star):
 
     # --- LLM Tool: 手动写入记忆 ---
     @filter.llm_tool(name="mnemosyne_write_memory")
-    async def mnemosyne_write_memory(self, event: AstrMessageEvent, content: str, use_summary: str = "false"):
+    async def mnemosyne_write_memory(self, event: AstrMessageEvent, content: str, use_summary: str = "false", event_date: str = "", event_status: str = ""):
         """手动写入一条长期记忆到向量数据库。当你觉得当前对话中有重要信息需要记住时调用。
-        
+
         Args:
             content(string): 要写入的记忆内容，尽量具体完整
             use_summary(string): 是否使用LLM总结后再写入（"true"=总结后写入，"false"=直接写入），默认直接写入
+            event_date(string): 可选。事件实际发生的日期(YYYY-MM-DD)，提旧事时填旧事原本的日期而非今天
+            event_status(string): 可选。事件状态：planned(计划中)/done(已完成)/recurring(长期重复)/cancelled(已取消)
         """
         if not self._initialization_successful:
             yield event.plain_result("记忆系统未初始化完成，无法写入。")
@@ -860,13 +862,28 @@ class Mnemosyne(Star):
                 from .core.memory_operations import validate_session_id
                 sid_valid = validate_session_id(session_id) if session_id else False
                 logger.info(f"[MWM-DEBUG] session_id valid={sid_valid}")
-                
-                result = await memory_operations.store_manual_memory(
-                    plugin=self,
-                    event=event,
-                    memory_content=content,
-                    source="llm_tool_manual",
-                )
+
+                # [event] 事件字段直通
+                _event_extra = {}
+                if event_date and len(event_date) == 10:
+                    _event_extra["event_date"] = event_date
+                if event_status in ("planned", "done", "recurring", "cancelled"):
+                    _event_extra["event_status"] = event_status
+
+                if _event_extra:
+                    from .core import active_memory_tools
+                    result = await active_memory_tools._store_with_meta(
+                        self, event, content,
+                        extra_meta=_event_extra,
+                        source="llm_tool_manual",
+                    )
+                else:
+                    result = await memory_operations.store_manual_memory(
+                        plugin=self,
+                        event=event,
+                        memory_content=content,
+                        source="llm_tool_manual",
+                    )
                 logger.info(f"[MWM-DEBUG] store_manual_memory 返回: {result}")
                 if result:
                     yield "已直接写入长期记忆。"
@@ -878,18 +895,27 @@ class Mnemosyne(Star):
         return
 
     @filter.llm_tool(name="memory_pin")
-    async def memory_pin(self, event: AstrMessageEvent, content: str):
+    async def memory_pin(self, event: AstrMessageEvent, content: str, event_date: str = "", event_status: str = ""):
         """钉住一条重要记忆，永不衰减、检索时恒定最高优先级。当你判断某件事对你和对方的关系有长期意义、绝不能忘时调用。请谨慎使用——重要的东西必须稀缺，否则重要就失去意义。
 
         Args:
             content(string): 要永久记住的内容，用完整具体的一句话描述
+            event_date(string): 可选。事件实际发生的日期(YYYY-MM-DD)，提旧事时填旧事原本的日期而非今天
+            event_status(string): 可选。事件状态：planned(计划中)/done(已完成)/recurring(长期重复)/cancelled(已取消)
         """
         if not self._initialization_successful:
             yield event.plain_result("记忆系统未初始化。")
             return
         try:
             from .core import active_memory_tools
-            ok = await active_memory_tools.pin_memory(self, event, content)
+            extra = {"pinned": True}
+            if event_date and len(event_date) == 10:
+                extra["event_date"] = event_date
+            if event_status in ("planned", "done", "recurring", "cancelled"):
+                extra["event_status"] = event_status
+            ok = await active_memory_tools._store_with_meta(
+                self, event, content, extra_meta=extra, source="kai_pin"
+            )
             yield "已钉住这条记忆，它不会淡去。" if ok else "钉住失败。"
         except Exception as e:
             logger.error(f"memory_pin error: {e}", exc_info=True)
