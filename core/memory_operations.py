@@ -253,9 +253,21 @@ def _post_process_search_results(
     _FRESHNESS_HALF_LIFE_HRS = 36.0
 
     def _decay_weight(item: dict[str, Any]) -> float:
-        """短期看时间、长期看情绪的衰减权重，返回 (0, ~2] 区间。"""
+        """短期看时间、长期看情绪的衰减权重，返回 (0, ~2] 区间。
+        特殊状态：pinned 恒高权重；feel 恒定不衰减；resolved 大幅降权。"""
         if not _decay_enabled:
             return 1.0
+
+        # 主动记忆状态（由 Kai 通过 tool 标记）
+        meta = item.get("_meta", {})
+        if isinstance(meta, dict):
+            if meta.get("pinned"):
+                return 2.0  # 钉住的记忆恒定最高权重
+            if meta.get("type") == "feel":
+                return 1.0  # 感受是痕迹，不衰减不增强
+            if meta.get("resolved"):
+                return 0.05  # 已翻篇的事快速淡出
+
         ct = item.get("create_time")
         if not isinstance(ct, (int, float)) or ct <= 0:
             return 0.5

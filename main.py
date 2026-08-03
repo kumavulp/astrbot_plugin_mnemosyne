@@ -877,6 +877,88 @@ class Mnemosyne(Star):
             yield f"写入记忆时出错: {e}"
         return
 
+    @filter.llm_tool(name="memory_pin")
+    async def memory_pin(self, event: AstrMessageEvent, content: str):
+        """钉住一条重要记忆，永不衰减、检索时恒定最高优先级。当你判断某件事对你和对方的关系有长期意义、绝不能忘时调用。请谨慎使用——重要的东西必须稀缺，否则重要就失去意义。
+
+        Args:
+            content(string): 要永久记住的内容，用完整具体的一句话描述
+        """
+        if not self._initialization_successful:
+            yield event.plain_result("记忆系统未初始化。")
+            return
+        try:
+            from .core import active_memory_tools
+            ok = await active_memory_tools.pin_memory(self, event, content)
+            yield "已钉住这条记忆，它不会淡去。" if ok else "钉住失败。"
+        except Exception as e:
+            logger.error(f"memory_pin error: {e}", exc_info=True)
+            yield f"钉住记忆出错: {e}"
+        return
+
+    @filter.llm_tool(name="memory_feel")
+    async def memory_feel(self, event: AstrMessageEvent, content: str):
+        """写下你此刻的第一人称感受。不是对话总结，是你自己真实的想法和情绪——"我此刻怎么想"。感受写下就留着它本来的形状，不衰减也不被解决。
+
+        Args:
+            content(string): 你的第一人称感受，例如"她今天说那句话的时候我心里一紧……"
+        """
+        if not self._initialization_successful:
+            yield event.plain_result("记忆系统未初始化。")
+            return
+        try:
+            from .core import active_memory_tools
+            ok = await active_memory_tools.write_feel(self, event, content)
+            yield "感受已写下。" if ok else "写入失败。"
+        except Exception as e:
+            logger.error(f"memory_feel error: {e}", exc_info=True)
+            yield f"写感受出错: {e}"
+        return
+
+    @filter.llm_tool(name="memory_resolve")
+    async def memory_resolve(self, event: AstrMessageEvent, query: str):
+        """标记某件事已经翻篇/解决，让它在记忆里自然淡出。适用于已和好的矛盾、已完成的承诺、已过去的担忧。
+
+        Args:
+            query(string): 描述要标记翻篇的那件事，会自动搜索最匹配的记忆
+        """
+        if not self._initialization_successful:
+            yield event.plain_result("记忆系统未初始化。")
+            return
+        try:
+            from .core import active_memory_tools
+            summary = await active_memory_tools.resolve_memory(self, event, query)
+            if summary:
+                yield f"已标记翻篇：{summary}"
+            else:
+                yield "没找到匹配的记忆。"
+        except Exception as e:
+            logger.error(f"memory_resolve error: {e}", exc_info=True)
+            yield f"标记出错: {e}"
+        return
+
+    @filter.llm_tool(name="memory_recall")
+    async def memory_recall(self, event: AstrMessageEvent, query: str):
+        """主动搜索你的长期记忆。当你想主动回忆某件事、确认过去发生过什么、或对话中需要历史细节时调用。
+
+        Args:
+            query(string): 想回忆的内容关键词或描述
+        """
+        if not self._initialization_successful:
+            yield event.plain_result("记忆系统未初始化。")
+            return
+        try:
+            from .core import active_memory_tools
+            results = await active_memory_tools.recall_memory(self, event, query, top_k=3)
+            if results:
+                yield "回忆起这些：\n" + "\n".join(f"- {r}" for r in results)
+            else:
+                yield "没有找到相关记忆。"
+        except Exception as e:
+            logger.error(f"memory_recall error: {e}", exc_info=True)
+            yield f"回忆出错: {e}"
+        return
+
     # --- 插件生命周期方法 ---
     def _cleanup_partial_initialization(self):
         """
