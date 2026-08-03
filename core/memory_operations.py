@@ -223,71 +223,113 @@ def _post_process_search_results(
         if filtered:
             prepared = filtered
 
-    # 关键词 + 图谱扩展重排
-    keywords = extract_query_keywords(query_text, min_token_len=2)
-    if not keywords:
-        return prepared
+    # ============================================================
+    # 三通道融合打分（参考 Ombre Brain 检索模型）
+    #   向量语义(0.4) + BM25(0.3) + fuzzy关键词(0.3)，整体乘衰减权重
+    # 衰减模型：短期/长期权重分离
+    #   短期(≤3天)：时间新鲜度主导 —— 刚发生的事印象最新
+    #   长期(>3天)：情绪强度主导 —— 刻骨铭心 vs 已经无所谓
+    # ============================================================
+    import math as _math
+    import time as _time
 
+    keywords = extract_query_keywords(query_text, min_token_len=2)
     use_graph = plugin.config.get("use_lightweight_memory_graph", True)
-    expanded = _expand_graph_keywords(keywords, prepared) if use_graph else []
+    expanded = _expand_graph_keywords(keywords, prepared) if (use_graph and keywords) else []
     all_terms = keywords + [term for term in expanded if term not in keywords]
 
-    def _semantic_score(item: dict[str, Any]) -> float:
-        distance = item.get("_distance")
-        if isinstance(distance, (int, float)):
-            # 距离越小越相似，这里转为“分数越大越好”。
-            return -float(distance)
-        return 0.0
-
-    # [decay] 时间衰减因子
-    import math as _math
     _decay_enabled = plugin.config.get("decay_enabled", True)
     _decay_lambda = plugin.config.get("decay_lambda", 0.01)
-    _now = _math.floor(__import__("time").time())
+    _now = _math.floor(_time.time())
 
-    _emotional_keywords = frozenset("哭,崩溃,害怕,焦虑,恐惧,绝望,难过,委屈,心疼,生气,吵架,和好,道歉,想你,想我,爱你,爱我,撒娇,吃醋,感动,高潮,亲密,月经,多囊,荨麻疹,纪念,结婚,求婚,520,小荷包,院子,李小黑,Cc,小橘子,小花".split(","))
-    def _time_decay_score(item: dict[str, Any]) -> float:
+    # 情绪词表：命中密度作为近似 arousal（唤醒度）
+    _emotional_keywords = frozenset(
+        "哭,崩溃,害怕,焦虑,恐惧,绝望,难过,委屈,心疼,生气,吵架,和好,道歉,"
+        "想你,想我,爱你,爱我,撒娇,吃醋,感动,高潮,亲密,月经,多囊,荨麻疹,"
+        "纪念,结婚,求婚,520,小荷包,院子,李小黑,Cc,小橘子,小花".split(",")
+    )
+    _AROUSAL_BOOST = 0.8       # 学 OB：arousal 每 +1 → 情绪权重 +0.8
+    _SHORT_TERM_DAYS = 3.0
+    _FRESHNESS_HALF_LIFE_HRS = 36.0
+
+    def _decay_weight(item: dict[str, Any]) -> float:
+        """短期看时间、长期看情绪的衰减权重，返回 (0, ~2] 区间。"""
         if not _decay_enabled:
             return 1.0
         ct = item.get("create_time")
         if not isinstance(ct, (int, float)) or ct <= 0:
             return 0.5
         age_days = max((_now - ct) / 86400.0, 0)
-        c = str(item.get("content", ""))
-        is_emotional = any(kw in c for kw in _emotional_keywords)
-        rate = _decay_lambda * 0.5 if is_emotional else _decay_lambda
-        return _math.exp(-rate * age_days)
-
-    scored = []
-    for item in prepared:
         content = str(item.get("content", ""))
-        content_l = content.lower()
-        keyword_hits = 0.0
+
+        # 近似 arousal：情绪词命中数 / 3 封顶为 1.0
+        hits = sum(1 for kw in _emotional_keywords if kw in content)
+        arousal = min(hits / 3.0, 1.0)
+        emotion_weight = 1.0 + arousal * _AROUSAL_BOOST
+
+        # 新鲜度：刚存 ×2.0，36h 半衰，72h 后趋近 ×1.0
+        freshness = 1.0 + _math.exp(-(age_days * 24.0) / _FRESHNESS_HALF_LIFE_HRS)
+
+        if age_days <= _SHORT_TERM_DAYS:
+            combined = freshness * 0.7 + emotion_weight * 0.3
+        else:
+            combined = emotion_weight * 0.7 + freshness * 0.3
+
+        base_decay = _math.exp(-_decay_lambda * age_days)
+        return base_decay * combined
+
+    # --- 通道1: 向量语义分（候选集内 min-max 归一化到 [0,1]） ---
+    raw_semantic: list[float] = []
+    for item in prepared:
+        distance = item.get("_distance")
+        raw_semantic.append(-float(distance) if isinstance(distance, (int, float)) else 0.0)
+    s_min, s_max = (min(raw_semantic), max(raw_semantic)) if raw_semantic else (0.0, 0.0)
+    s_range = (s_max - s_min) or 1.0
+    semantic_norm = [(s - s_min) / s_range for s in raw_semantic]
+
+    # --- 通道2: BM25（软依赖，缺失时返回空 dict） ---
+    try:
+        from .bm25_search import score_candidates as _bm25_score
+        bm25_scores = _bm25_score(query_text, prepared)
+    except Exception:
+        bm25_scores = {}
+
+    # --- 通道3: fuzzy 关键词（归一化：命中数 / 词项总数） ---
+    fuzzy_norm: list[float] = []
+    n_terms = max(len(all_terms), 1)
+    for item in prepared:
+        content_l = str(item.get("content", "")).lower()
+        hit = 0.0
         for term in all_terms:
             term_l = term.lower()
             if not term_l:
                 continue
             if term_l in content_l:
-                keyword_hits += 1.0
+                hit += 1.0
             else:
                 try:
                     from rapidfuzz import fuzz as _fuzz
                     ratio = _fuzz.partial_ratio(term_l, content_l)
                     if ratio >= 75:
-                        keyword_hits += ratio / 100.0
+                        hit += ratio / 100.0
                 except ImportError:
                     pass
-        decay = _time_decay_score(item)
-        scored.append((keyword_hits, _semantic_score(item) * decay, decay, item))
+        fuzzy_norm.append(min(hit / n_terms, 1.0))
 
-    if any(hit > 0 for hit, _, _, _ in scored):
-        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        return [item for _, _, _, item in scored]
-    # 即使没有关键词命中，也按衰减排序
-    if _decay_enabled:
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return [item for _, _, _, item in scored]
-    return prepared
+    # --- 融合 + 衰减 ---
+    W_VEC, W_BM25, W_FUZZY = 0.4, 0.3, 0.3
+    scored = []
+    for i, item in enumerate(prepared):
+        fusion = (
+            W_VEC * semantic_norm[i]
+            + W_BM25 * bm25_scores.get(i, 0.0)
+            + W_FUZZY * fuzzy_norm[i]
+        )
+        final = fusion * _decay_weight(item)
+        scored.append((final, item))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [item for _, item in scored]
 
 
 async def handle_query_memory(

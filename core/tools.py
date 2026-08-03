@@ -368,9 +368,36 @@ def get_event_platform_id(event: AstrMessageEvent) -> str:
     return ""
 
 
+# jieba 中文分词（软依赖）：装了用真正的词，没装回退到正则窗口切片
+try:
+    import jieba as _jieba
+    import jieba.posseg as _jieba_posseg
+    import logging as _logging
+    _jieba.setLogLevel(_logging.WARNING)
+    _JIEBA_OK = True
+except ImportError:
+    _jieba = None
+    _jieba_posseg = None
+    _JIEBA_OK = False
+
+# 中文停用词：这些词单独出现没有检索价值
+_ZH_STOPWORDS = frozenset(
+    "的,了,是,在,和,与,或,但,而,就,都,也,又,还,很,更,最,不,没,没有,一个,这个,那个,"
+    "什么,怎么,为什么,因为,所以,如果,虽然,但是,然后,还是,或者,而且,以及,关于,对于,"
+    "通过,可以,已经,正在,将要,应该,可能,需要,想要,觉得,认为,表示,进行,发现,出现,"
+    "开始,结束,继续,之后,之前,时候,现在,今天,昨天,明天,这里,那里,自己,他们,我们,"
+    "你们,一起,一下,一些,有点,有些,非常,特别,比较,其他,其中,包括,以及,并且".split(",")
+)
+
+# 保留的词性：名词类/动词类/形容词/专名/英文，过滤掉助词副词等
+# 形容词(a)必须保留：亲密/难过/开心 这类情绪词对记忆检索价值很高
+_KEEP_POS_PREFIX = ("n", "v", "a", "eng", "x", "j", "i", "l")
+
+
 def extract_query_keywords(text: str, min_token_len: int = 2) -> list[str]:
     """
-    从用户查询中提取关键词，用于关键词重排和轻量图谱扩展。
+    从文本中提取关键词，用于关键词重排、轻量图谱与 BM25 检索。
+    优先使用 jieba 词性分词（提取真实的词而非窗口片段），未安装时回退正则。
     """
     if not isinstance(text, str) or not text.strip():
         return []
@@ -378,14 +405,33 @@ def extract_query_keywords(text: str, min_token_len: int = 2) -> list[str]:
     keywords: list[str] = []
     seen: set[str] = set()
 
-    # 英文/数字词
+    # 英文/数字词（两种模式通用）
     for token in re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]{1,}", text):
         token_norm = token.lower().strip()
         if len(token_norm) >= max(min_token_len, 3) and token_norm not in seen:
             keywords.append(token_norm)
             seen.add(token_norm)
 
-    # 连续中文片段
+    if _JIEBA_OK:
+        # jieba 词性分词：只保留名词/动词/专名，过滤停用词和超长片段
+        try:
+            for word, flag in _jieba_posseg.cut(text):
+                w = word.strip()
+                if (
+                    len(w) >= min_token_len
+                    and len(w) <= 8
+                    and w not in seen
+                    and w not in _ZH_STOPWORDS
+                    and re.search(r"[\u4e00-\u9fff]", w)
+                    and flag[:1] in _KEEP_POS_PREFIX
+                ):
+                    keywords.append(w)
+                    seen.add(w)
+            return keywords
+        except Exception:
+            pass  # jieba 异常时静默回退正则
+
+    # 回退：连续中文片段（限制2-6字）
     for token in re.findall(r"[\u4e00-\u9fff]{2,6}", text):
         token_norm = token.strip()
         if len(token_norm) >= min_token_len and token_norm not in seen:
